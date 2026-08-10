@@ -2,7 +2,8 @@ package http
 
 import (
 	"context"
-	"net/http"
+	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,8 +149,8 @@ func (m *mockBodyBuffer) Copy() []byte {
 	return nil
 }
 
-func (m *mockBodyBuffer) NewReader() http.Header {
-	return nil
+func (m *mockBodyBuffer) NewReader() io.Reader {
+	return strings.NewReader("")
 }
 
 func TestHTTP1Metrics(t *testing.T) {
@@ -197,20 +198,10 @@ func TestHTTP1Metrics(t *testing.T) {
 	// Simulate response body
 	bodyStatus := httpInstance.ResponseBody(&mockBodyBuffer{}, true)
 	assert.Equal(t, plugins.BodyStatusContinue, bodyStatus)
-
-	// Destroy should record metrics
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded, "Metrics should be marked as recorded")
-
-	// Calling Destroy again should not panic (idempotent)
-	httpInstance.Destroy()
 }
 
 func TestGRPCMetrics_Success(t *testing.T) {
-	// Create a factory
 	factory := &Factory{}
-
-	// Create plugin context for gRPC
 	ctx := &mockPluginContext{
 		protocol:   "grpc",
 		endpoint:   "10.42.0.3:9090",
@@ -218,48 +209,34 @@ func TestGRPCMetrics_Success(t *testing.T) {
 		writeBytes: 1024,
 	}
 
-	// Create plugin instance
-	instance := factory.NewHttpInstance(ctx, nil)
-	require.NotNil(t, instance)
-	
-	httpInstance, ok := instance.(*filterInstance)
-	require.True(t, ok)
+	inst := factory.NewGrpcInstance(ctx, nil).(*grpcMetricsInstance)
 
-	// Simulate gRPC request
 	reqHeaders := newMockHeaders(map[string]string{
 		":method":      "POST",
 		":authority":   "10.42.0.3:9090",
 		":path":        "/echo.EchoService/Echo",
 		"content-type": "application/grpc+json",
 	})
-	status := httpInstance.RequestHeaders(reqHeaders, false)
+	status := inst.RequestHeaders(reqHeaders, false)
 	assert.Equal(t, plugins.HeadersStatusContinue, status)
-	assert.Equal(t, "POST", httpInstance.method)
-	assert.Equal(t, "10.42.0.3:9090", httpInstance.host)
-	assert.Equal(t, "/echo.EchoService/Echo", httpInstance.rpcMethod, "gRPC should extract rpc_method from :path")
+	assert.Equal(t, "POST", inst.method)
+	assert.Equal(t, "10.42.0.3:9090", inst.host)
 
-	// Simulate response with HTTP 200 (initial)
 	resHeaders := newMockHeaders(map[string]string{
-		":status": "200",
+		":status":     "200",
+		"Grpc-Status": "0",
 	})
-	status = httpInstance.ResponseHeaders(resHeaders, false)
+	status = inst.ResponseHeaders(resHeaders, false)
 	assert.Equal(t, plugins.HeadersStatusContinue, status)
-	assert.Equal(t, "200", httpInstance.statusCode)
+	assert.Equal(t, "200", inst.statusCode)
 
-	// In real scenario, session.HandleTrailers() would update statusCode to final gRPC status
-	// For grpc-status=0 (OK), it remains 200
-	// Here we simulate that the status is already correct
-
-	// Destroy should record gRPC metrics
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
+	inst.Destroy()
+	assert.True(t, inst.metricsRecorded)
+	assert.Equal(t, "/echo.EchoService/Echo", inst.rpcMethod)
 }
 
 func TestGRPCMetrics_NotFound(t *testing.T) {
-	// Create a factory
 	factory := &Factory{}
-
-	// Create plugin context for gRPC
 	ctx := &mockPluginContext{
 		protocol:   "grpc",
 		endpoint:   "10.42.0.3:9090",
@@ -267,40 +244,29 @@ func TestGRPCMetrics_NotFound(t *testing.T) {
 		writeBytes: 256,
 	}
 
-	// Create plugin instance
-	instance := factory.NewHttpInstance(ctx, nil)
-	require.NotNil(t, instance)
-	
-	httpInstance, ok := instance.(*filterInstance)
-	require.True(t, ok)
+	inst := factory.NewGrpcInstance(ctx, nil).(*grpcMetricsInstance)
 
-	// Simulate gRPC request
 	reqHeaders := newMockHeaders(map[string]string{
 		":method":      "POST",
 		":authority":   "10.42.0.3:9090",
 		":path":        "/echo.EchoService/NonExistent",
 		"content-type": "application/grpc",
 	})
-	httpInstance.RequestHeaders(reqHeaders, false)
+	inst.RequestHeaders(reqHeaders, false)
 
-	// Simulate response - session.HandleTrailers() would map grpc-status=5 to HTTP 404
 	resHeaders := newMockHeaders(map[string]string{
-		":status":     "404", // Mapped from grpc-status=5
-		"grpc-status": "5",
+		":status":     "404",
+		"Grpc-Status": "5",
 	})
-	httpInstance.ResponseHeaders(resHeaders, false)
-	assert.Equal(t, "404", httpInstance.statusCode)
+	inst.ResponseHeaders(resHeaders, false)
 
-	// Destroy should record gRPC metrics with status 404
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
+	inst.Destroy()
+	assert.Equal(t, "404", inst.statusCode)
+	assert.True(t, inst.metricsRecorded)
 }
 
 func TestGRPCMetrics_Cancelled(t *testing.T) {
-	// Create a factory
 	factory := &Factory{}
-
-	// Create plugin context for gRPC
 	ctx := &mockPluginContext{
 		protocol:   "grpc",
 		endpoint:   "10.42.0.3:9090",
@@ -308,39 +274,29 @@ func TestGRPCMetrics_Cancelled(t *testing.T) {
 		writeBytes: 50,
 	}
 
-	// Create plugin instance
-	instance := factory.NewHttpInstance(ctx, nil)
-	require.NotNil(t, instance)
-	
-	httpInstance, ok := instance.(*filterInstance)
-	require.True(t, ok)
+	inst := factory.NewGrpcInstance(ctx, nil).(*grpcMetricsInstance)
 
-	// Simulate gRPC request
 	reqHeaders := newMockHeaders(map[string]string{
 		":method":      "POST",
 		":authority":   "10.42.0.3:9090",
 		":path":        "/echo.EchoService/SlowMethod",
 		"content-type": "application/grpc",
 	})
-	httpInstance.RequestHeaders(reqHeaders, false)
+	inst.RequestHeaders(reqHeaders, false)
 
-	// Simulate cancelled stream - session.Close() sets grpc-status=1 → HTTP 499
 	resHeaders := newMockHeaders(map[string]string{
-		":status":     "499", // Mapped from grpc-status=1 (CANCELLED)
-		"grpc-status": "1",
+		":status":     "499",
+		"Grpc-Status": "1",
 	})
-	httpInstance.ResponseHeaders(resHeaders, false)
-	assert.Equal(t, "499", httpInstance.statusCode)
+	inst.ResponseHeaders(resHeaders, false)
 
-	// Destroy should record gRPC metrics with status 499
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
+	inst.Destroy()
+	assert.Equal(t, "499", inst.statusCode)
+	assert.True(t, inst.metricsRecorded)
 }
 
 func TestGRPCMetrics_TrailersOnly(t *testing.T) {
-	// Test the Trailers-Only response pattern (single HEADERS frame with status + grpc-status)
 	factory := &Factory{}
-
 	ctx := &mockPluginContext{
 		protocol:   "grpc",
 		endpoint:   "10.42.0.3:9090",
@@ -348,33 +304,25 @@ func TestGRPCMetrics_TrailersOnly(t *testing.T) {
 		writeBytes: 150,
 	}
 
-	instance := factory.NewHttpInstance(ctx, nil)
-	require.NotNil(t, instance)
-	
-	httpInstance, ok := instance.(*filterInstance)
-	require.True(t, ok)
+	inst := factory.NewGrpcInstance(ctx, nil).(*grpcMetricsInstance)
 
-	// Simulate gRPC request
 	reqHeaders := newMockHeaders(map[string]string{
 		":method":      "POST",
 		":authority":   "10.42.0.3:9090",
 		":path":        "/echo.EchoService/QuickError",
 		"content-type": "application/grpc",
 	})
-	httpInstance.RequestHeaders(reqHeaders, false)
+	inst.RequestHeaders(reqHeaders, false)
 
-	// Trailers-Only response: single HEADERS with :status and grpc-status
-	// session.HandleTrailers() maps grpc-status=3 (INVALID_ARGUMENT) → HTTP 400
 	resHeaders := newMockHeaders(map[string]string{
 		":status":     "400",
-		"grpc-status": "3",
+		"Grpc-Status": "3",
 	})
-	httpInstance.ResponseHeaders(resHeaders, true) // endStream=true
-	assert.Equal(t, "400", httpInstance.statusCode)
+	inst.ResponseHeaders(resHeaders, true)
 
-	// Destroy should record gRPC metrics
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
+	inst.Destroy()
+	assert.Equal(t, "400", inst.statusCode)
+	assert.True(t, inst.metricsRecorded)
 }
 
 func TestHTTP2Metrics(t *testing.T) {
@@ -404,7 +352,7 @@ func TestHTTP2Metrics(t *testing.T) {
 	status := httpInstance.RequestHeaders(reqHeaders, false)
 	assert.Equal(t, plugins.HeadersStatusContinue, status)
 	assert.Equal(t, "GET", httpInstance.method)
-	assert.Empty(t, httpInstance.rpcMethod, "HTTP/2 (non-gRPC) should not extract rpc_method")
+	assert.Empty(t, httpInstance.rpcMethod)
 
 	// Simulate response
 	resHeaders := newMockHeaders(map[string]string{
@@ -412,16 +360,10 @@ func TestHTTP2Metrics(t *testing.T) {
 	})
 	httpInstance.ResponseHeaders(resHeaders, false)
 	assert.Equal(t, "200", httpInstance.statusCode)
-
-	// Destroy should record HTTP metrics (not gRPC metrics)
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
 }
 
 func TestGRPCMetrics_MissingRPCMethod(t *testing.T) {
-	// Test gRPC request without :path header (edge case)
 	factory := &Factory{}
-
 	ctx := &mockPluginContext{
 		protocol:   "grpc",
 		endpoint:   "10.42.0.3:9090",
@@ -429,36 +371,28 @@ func TestGRPCMetrics_MissingRPCMethod(t *testing.T) {
 		writeBytes: 100,
 	}
 
-	instance := factory.NewHttpInstance(ctx, nil)
-	require.NotNil(t, instance)
-	
-	httpInstance, ok := instance.(*filterInstance)
-	require.True(t, ok)
+	inst := factory.NewGrpcInstance(ctx, nil).(*grpcMetricsInstance)
 
-	// Simulate gRPC request WITHOUT :path header
 	reqHeaders := newMockHeaders(map[string]string{
 		":method":      "POST",
 		":authority":   "10.42.0.3:9090",
 		"content-type": "application/grpc",
 	})
-	httpInstance.RequestHeaders(reqHeaders, false)
-	assert.Empty(t, httpInstance.rpcMethod, "Missing :path should result in empty rpc_method")
+	inst.RequestHeaders(reqHeaders, false)
 
-	// Simulate response
 	resHeaders := newMockHeaders(map[string]string{
-		":status": "200",
+		":status":     "200",
+		"Grpc-Status": "0",
 	})
-	httpInstance.ResponseHeaders(resHeaders, false)
+	inst.ResponseHeaders(resHeaders, false)
 
-	// Destroy should handle missing rpc_method gracefully (sets to "unknown")
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
+	inst.Destroy()
+	assert.Equal(t, "unknown", inst.rpcMethod)
+	assert.True(t, inst.metricsRecorded)
 }
 
 func TestMetricsRecordedOnlyOnce(t *testing.T) {
-	// Verify that metrics are only recorded once even if Destroy() is called multiple times
 	factory := &Factory{}
-
 	ctx := &mockPluginContext{
 		protocol:   "grpc",
 		endpoint:   "10.42.0.3:9090",
@@ -466,32 +400,24 @@ func TestMetricsRecordedOnlyOnce(t *testing.T) {
 		writeBytes: 100,
 	}
 
-	instance := factory.NewHttpInstance(ctx, nil)
-	require.NotNil(t, instance)
-	
-	httpInstance, ok := instance.(*filterInstance)
-	require.True(t, ok)
+	inst := factory.NewGrpcInstance(ctx, nil).(*grpcMetricsInstance)
 
-	// Setup basic request/response
 	reqHeaders := newMockHeaders(map[string]string{
 		":method":      "POST",
 		":authority":   "10.42.0.3:9090",
 		":path":        "/test.Service/Method",
 		"content-type": "application/grpc",
 	})
-	httpInstance.RequestHeaders(reqHeaders, false)
+	inst.RequestHeaders(reqHeaders, false)
 
 	resHeaders := newMockHeaders(map[string]string{
-		":status": "200",
+		":status":     "200",
+		"Grpc-Status": "0",
 	})
-	httpInstance.ResponseHeaders(resHeaders, false)
+	inst.ResponseHeaders(resHeaders, false)
 
-	// First Destroy() should record metrics
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
-
-	// Second Destroy() should be a no-op (not panic, not double-record)
-	httpInstance.Destroy()
-	httpInstance.Destroy()
-	assert.True(t, httpInstance.metricsRecorded)
+	inst.Destroy()
+	inst.Destroy()
+	inst.Destroy()
+	assert.True(t, inst.metricsRecorded)
 }
