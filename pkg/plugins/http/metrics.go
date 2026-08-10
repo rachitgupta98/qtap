@@ -16,6 +16,7 @@ var (
 )
 
 var (
+	// HTTP metrics (for HTTP/1 and HTTP/2 traffic)
 	requestsTotal    = metrics.NewCounterVec("requests_total", "The total number of requests", []string{"method", "host", "status_code", "protocol"})
 	requestsDuration = metrics.NewHistogramVec("requests_duration_ms", "The duration of requests in milliseconds", []string{"method", "host", "status_code", "protocol"}, durationBuckets...)
 	requestsSize     = metrics.NewHistogramVec("requests_size_bytes", "The size of requests in bytes", []string{"method", "host", "status_code", "protocol"}, sizeBuckets...)
@@ -25,4 +26,15 @@ var (
 	responsesSize     = metrics.NewHistogramVec("responses_size_bytes", "The size of responses in bytes", []string{"method", "host", "status_code", "protocol"}, sizeBuckets...)
 
 	duration = metrics.NewHistogram("duration_ms", "The combined duration of requests and responses in milliseconds", durationBuckets...)
+
+	// gRPC-specific metrics with rpc_method label (no protocol label - always grpc)
+	grpcRequestsTotal    = metrics.NewCounterVec("grpc_requests_total", "The total number of gRPC requests", []string{"method", "host", "status_code", "rpc_method"})
+	grpcRequestsDuration = metrics.NewHistogramVec("grpc_requests_duration_ms", "The duration of gRPC requests in milliseconds", []string{"method", "host", "status_code", "rpc_method"}, durationBuckets...)
+	grpcRequestsSize     = metrics.NewHistogramVec("grpc_requests_size_bytes", "The size of gRPC requests in bytes", []string{"method", "host", "status_code", "rpc_method"}, sizeBuckets...)
+
+	grpcResponsesTotal    = metrics.NewCounterVec("grpc_responses_total", "The total number of gRPC responses", []string{"method", "host", "status_code", "rpc_method"})
+	grpcResponsesDuration = metrics.NewHistogramVec("grpc_responses_duration_ms", "The duration of gRPC responses in milliseconds", []string{"method", "host", "status_code", "rpc_method"}, durationBuckets...)
+	grpcResponsesSize     = metrics.NewHistogramVec("grpc_responses_size_bytes", "The size of gRPC responses in bytes", []string{"method", "host", "status_code", "rpc_method"}, sizeBuckets...)
+
+	grpcDuration = metrics.NewHistogramVec("grpc_duration_ms", "The combined duration of gRPC requests and responses in milliseconds", []string{"rpc_method"}, durationBuckets...)
 )

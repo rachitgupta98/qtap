@@ -35,15 +35,17 @@ func (f *Factory) NewHttpInstance(ctx plugins.PluginContext, svcs *services.Serv
 func (f *Factory) Destroy() {}
 
 type filterInstance struct {
-	logger        *zap.Logger
-	ctx           plugins.PluginContext
-	filter        *Factory
-	prefix        string
-	requestStart  time.Time
-	responseStart time.Time
-	method        string
-	host          string
-	statusCode    string
+	logger          *zap.Logger
+	ctx             plugins.PluginContext
+	filter          *Factory
+	prefix          string
+	requestStart    time.Time
+	responseStart   time.Time
+	method          string
+	host            string
+	statusCode      string
+	rpcMethod       string // gRPC RPC method from :path header
+	metricsRecorded bool   // prevent double-recording in Destroy()
 }
 
 func (h *filterInstance) RequestHeaders(headers plugins.Headers, endStream bool) plugins.HeadersStatus {
@@ -55,6 +57,14 @@ func (h *filterInstance) RequestHeaders(headers plugins.Headers, endStream bool)
 	}
 	if host, ok := headers.Get(":authority"); ok {
 		h.host = host.String()
+	}
+
+	// Extract RPC method for gRPC traffic
+	protocol := h.ctx.Meta().Protocol()
+	if protocol == "grpc" {
+		if path, ok := headers.Get(":path"); ok {
+			h.rpcMethod = path.String()
+		}
 	}
 
 	return plugins.HeadersStatusContinue
@@ -74,20 +84,13 @@ func (h *filterInstance) ResponseHeaders(headers plugins.Headers, endStream bool
 		h.statusCode = "000"
 	}
 
-	h.recordRequestMetrics()
-
-	if endStream {
-		h.recordResponseMetrics()
-	}
+	// Don't record metrics here - wait until Destroy() when gRPC trailers have been processed
 
 	return plugins.HeadersStatusContinue
 }
 
 func (h *filterInstance) ResponseBody(body plugins.BodyBuffer, endStream bool) plugins.BodyStatus {
-	if endStream {
-		h.recordResponseMetrics()
-	}
-
+	// Don't record metrics here - wait until Destroy() when gRPC trailers have been processed
 	return plugins.BodyStatusContinue
 }
 
@@ -118,7 +121,53 @@ func (h *filterInstance) recordResponseMetrics() {
 	duration.Observe(float64(time.Since(h.requestStart).Milliseconds()))
 }
 
+// recordGrpcMetrics records all gRPC metrics using the qtap_grpc_* metric family.
+// This is called in Destroy() after gRPC trailers have been processed by session.HandleTrailers().
+func (h *filterInstance) recordGrpcMetrics() {
+	host := h.host
+	if host == "" {
+		host = h.ctx.Meta().Endpoint()
+	}
+
+	// For gRPC, we need to get the final status code from response headers after trailer processing
+	// The session.HandleTrailers() updates the :status header with the mapped gRPC status
+	if h.ctx != nil {
+		// Try to get updated status from context if available
+		// For now, use the statusCode we captured (which should be updated by session.HandleTrailers)
+	}
+
+	rpcMethod := h.rpcMethod
+	if rpcMethod == "" {
+		rpcMethod = "unknown"
+	}
+
+	// Record request metrics
+	grpcRequestsTotal.WithLabelValues(h.method, host, h.statusCode, rpcMethod).Inc()
+	if !h.responseStart.IsZero() {
+		grpcRequestsDuration.WithLabelValues(h.method, host, h.statusCode, rpcMethod).Observe(float64(h.responseStart.Sub(h.requestStart).Milliseconds()))
+	}
+	grpcRequestsSize.WithLabelValues(h.method, host, h.statusCode, rpcMethod).Observe(float64(h.ctx.Meta().WriteBytes()))
+
+	// Record response metrics
+	grpcResponsesTotal.WithLabelValues(h.method, host, h.statusCode, rpcMethod).Inc()
+	if !h.responseStart.IsZero() {
+		grpcResponsesDuration.WithLabelValues(h.method, host, h.statusCode, rpcMethod).Observe(float64(time.Since(h.responseStart).Milliseconds()))
+	}
+	grpcResponsesSize.WithLabelValues(h.method, host, h.statusCode, rpcMethod).Observe(float64(h.ctx.Meta().ReadBytes()))
+
+	// Record combined duration
+	if !h.requestStart.IsZero() {
+		grpcDuration.WithLabelValues(rpcMethod).Observe(float64(time.Since(h.requestStart).Milliseconds()))
+	}
+}
+
 func (h *filterInstance) Destroy() {
+	// Prevent double-recording
+	if h.metricsRecorded {
+		return
+	}
+	h.metricsRecorded = true
+
 	protocol := h.ctx.Meta().Protocol()
 
 	host := h.host
@@ -126,8 +175,18 @@ func (h *filterInstance) Destroy() {
 		host = h.ctx.Meta().Endpoint()
 	}
 
-	requestsSize.WithLabelValues(h.method, host, h.statusCode, protocol).Observe(float64(h.ctx.Meta().WriteBytes()))
-	responsesSize.WithLabelValues(h.method, host, h.statusCode, protocol).Observe(float64(h.ctx.Meta().ReadBytes()))
+	// Branch based on protocol: gRPC gets separate metrics, HTTP/1 and HTTP/2 use existing metrics
+	if protocol == "grpc" {
+		h.recordGrpcMetrics()
+	} else {
+		// Record HTTP metrics (for HTTP/1 and HTTP/2)
+		h.recordRequestMetrics()
+		h.recordResponseMetrics()
+
+		// Record size metrics
+		requestsSize.WithLabelValues(h.method, host, h.statusCode, protocol).Observe(float64(h.ctx.Meta().WriteBytes()))
+		responsesSize.WithLabelValues(h.method, host, h.statusCode, protocol).Observe(float64(h.ctx.Meta().ReadBytes()))
+	}
 }
 
 func (f *Factory) PluginType() plugins.PluginType {

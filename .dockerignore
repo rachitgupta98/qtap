@@ -1,0 +1,34 @@
+# Git / IDE
+.git
+.gitignore
+.idea
+.vscode
+.cursor
+
+# Build outputs
+bin/
+dist/
+*.out
+*.test
+
+# Docs / examples (not needed to compile the agent)
+docs/
+examples/
+apps/
+*.md
+!README.md
+
+# CI / dev tooling
+.github/
+.golangci.yaml
+.env
+.env.*
+
+# Test artifacts
+**/testdata/
+**/*_test.go
+e2e/
+
+# Node (devtools source; prebuilt dist is committed)
+pkg/devtools/app/node_modules/
+pkg/devtools/app/src/
