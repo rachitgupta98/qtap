@@ -22,6 +22,25 @@ func newTestStream(t *testing.T) *HTTPStream {
 	return NewHTTPStream(t.Context(), "example.com", zap.NewNop(), conn)
 }
 
+// createTestServerStream creates a fully-initialized HTTPStream for a
+// server-role connection (Source: Server), mirroring createTestStream's
+// client-role setup. Used to verify server-side (ingress) HTTP/2 parsing,
+// where the client preface and request frames arrive as connection.Ingress
+// events (the server reads them) and the response is written by this
+// endpoint as connection.Egress events.
+func createTestServerStream(t *testing.T) *HTTPStream {
+	t.Helper()
+	conn := connection.NewConnection(
+		t.Context(),
+		zap.NewNop(),
+		&connection.OpenEvent{
+			Source: connection.Server,
+		},
+	)
+
+	return NewHTTPStream(t.Context(), "test.example.com", zap.NewNop(), conn)
+}
+
 // encodeHeadersFrame encodes fields using enc into buf and returns a raw HEADERS frame.
 // The same encoder must be reused across calls within a direction to maintain dynamic
 // table state between frames, mirroring what a real HTTP/2 client or server does.
@@ -639,6 +658,176 @@ func TestManyStreamsWithSamePath(t *testing.T) {
 		})
 		require.NoError(t, err, "stream %d response should not fail", streamID)
 	}
+}
+
+// TestServerRoleIngressGRPCParsing verifies that HTTP/2 (and gRPC) traffic is
+// parsed correctly for server-role connections (Source: Server), where the
+// client preface and request frames arrive as connection.Ingress events and
+// the response is written by this endpoint as connection.Egress events.
+//
+// This is the inverse of the client-role tests above (e.g.
+// TestSingleStreamRegression), which only send the preface/request via
+// connection.Egress. Before the fix, the preface was only ever stripped when
+// event.Direction == connection.Egress, so on a server-role connection the
+// leading preface bytes were never removed from the ingress buffer. The
+// framer would then try to interpret those bytes as a frame header, compute
+// a bogus (huge) frame length, and stall forever waiting for enough data —
+// meaning no request HEADERS frame was ever parsed and no session/gRPC
+// metrics were ever produced for ingress (server-side) captures.
+func TestServerRoleIngressGRPCParsing(t *testing.T) {
+	stream := createTestServerStream(t)
+
+	clientWriter := newFrameWriter()
+	serverWriter := newFrameWriter()
+
+	// Client → server bytes (preface + SETTINGS) arrive as Ingress events:
+	// this endpoint is the server, so it reads what the client sends.
+	preface := []byte(http2.ClientPreface)
+	clientWriter.writeSettings()
+	err := stream.Process(&connection.DataEvent{
+		Direction: connection.Ingress,
+		Data:      append(preface, clientWriter.bytes()...),
+	})
+	require.NoError(t, err)
+
+	// Server → client bytes (SETTINGS) arrive as Egress events: this endpoint
+	// is the server, so it writes its own response data.
+	serverWriter.writeSettings()
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Egress,
+		Data:      serverWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	// Client request HEADERS (gRPC) — arrives as Ingress.
+	clientWriter.writeHeaders(1, false, []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":path", Value: "/echo.EchoService/Echo"},
+		{Name: ":authority", Value: "server:9090"},
+		{Name: "content-type", Value: "application/grpc"},
+		{Name: "te", Value: "trailers"},
+	})
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Ingress,
+		Data:      clientWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	session1 := stream.sessions[1]
+	require.NotNil(t, session1, "session 1 should exist after ingress request HEADERS are parsed")
+	require.NotNil(t, session1.req, "session 1 should have a request")
+	assert.Equal(t, "/echo.EchoService/Echo", session1.req.RequestURI)
+	assert.Equal(t, "POST", session1.req.Method)
+	assert.True(t, session1.isGRPC, "gRPC content-type should be detected on a server-role ingress capture")
+	assert.Equal(t, connection.Protocol_GRPC, stream.conn.Protocol)
+
+	// Client request DATA (gRPC message) — arrives as Ingress.
+	clientWriter.writeData(1, true, []byte{0, 0, 0, 0, 0})
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Ingress,
+		Data:      clientWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	// Server response HEADERS — arrives as Egress.
+	serverWriter.writeHeaders(1, false, []hpack.HeaderField{
+		{Name: ":status", Value: "200"},
+		{Name: "content-type", Value: "application/grpc"},
+	})
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Egress,
+		Data:      serverWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	// Server response DATA — arrives as Egress.
+	serverWriter.writeData(1, false, []byte{0, 0, 0, 0, 2, 0x0a, 0x00})
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Egress,
+		Data:      serverWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	// Server trailers (grpc-status) — arrives as Egress.
+	serverWriter.writeHeaders(1, true, []hpack.HeaderField{
+		{Name: "grpc-status", Value: "0"},
+		{Name: "grpc-message", Value: ""},
+	})
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Egress,
+		Data:      serverWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	_, exists := stream.sessions[1]
+	assert.False(t, exists, "session 1 should be cleaned up after the response completes")
+
+	// Byte attribution: wrBytes must reflect the request (client→server,
+	// carried via Ingress on this server-role connection) and rdBytes must
+	// reflect the response (server→client, carried via Egress) — matching
+	// the "WriteBytes()==request size, ReadBytes()==response size" contract
+	// that http_metrics and other plugins rely on, regardless of role.
+	assert.Greater(t, session1.wrBytes, int64(0), "wrBytes should capture request bytes even though they arrived via Ingress")
+	assert.Greater(t, session1.rdBytes, int64(0), "rdBytes should capture response bytes even though they arrived via Egress")
+}
+
+// TestServerRoleMultiplexedStreams verifies that multiple concurrent gRPC
+// streams are each attributed to the correct path on a server-role
+// (ingress) connection, mirroring TestMultiplexedStreamPathAttribution.
+func TestServerRoleMultiplexedStreams(t *testing.T) {
+	stream := createTestServerStream(t)
+
+	clientWriter := newFrameWriter()
+	serverWriter := newFrameWriter()
+
+	preface := []byte(http2.ClientPreface)
+	clientWriter.writeSettings()
+	err := stream.Process(&connection.DataEvent{
+		Direction: connection.Ingress,
+		Data:      append(preface, clientWriter.bytes()...),
+	})
+	require.NoError(t, err)
+
+	serverWriter.writeSettings()
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Egress,
+		Data:      serverWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	clientWriter.writeHeaders(1, true, []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":path", Value: "/grpc.health.v1.Health/Check"},
+		{Name: ":authority", Value: "server:50051"},
+		{Name: "content-type", Value: "application/grpc"},
+		{Name: "te", Value: "trailers"},
+	})
+	clientWriter.writeHeaders(3, true, []hpack.HeaderField{
+		{Name: ":method", Value: "POST"},
+		{Name: ":scheme", Value: "http"},
+		{Name: ":path", Value: "/myapp.UserService/GetUser"},
+		{Name: ":authority", Value: "server:50051"},
+		{Name: "content-type", Value: "application/grpc"},
+		{Name: "te", Value: "trailers"},
+	})
+
+	err = stream.Process(&connection.DataEvent{
+		Direction: connection.Ingress,
+		Data:      clientWriter.bytes(),
+	})
+	require.NoError(t, err)
+
+	session1 := stream.sessions[1]
+	require.NotNil(t, session1)
+	require.NotNil(t, session1.req)
+	assert.Equal(t, "/grpc.health.v1.Health/Check", session1.req.RequestURI, "Stream 1 path")
+
+	session3 := stream.sessions[3]
+	require.NotNil(t, session3)
+	require.NotNil(t, session3.req)
+	assert.Equal(t, "/myapp.UserService/GetUser", session3.req.RequestURI, "Stream 3 path")
 }
 
 // TestBadHPACKFailOpen verifies that a bad HPACK frame on one stream

@@ -134,8 +134,10 @@ func (s *HTTPStream) Process(event *connection.DataEvent) error {
 
 	*buf = append(*buf, event.Data...)
 
-	// read the preface if we haven't already
-	if !s.prefaceRead && event.Direction == connection.Egress {
+	// read the preface if we haven't already. The client always sends the preface,
+	// so which physical direction carries it depends on whether this endpoint is
+	// the client or the server of the connection (see requestDirection).
+	if !s.prefaceRead && event.Direction == s.requestDirection() {
 		if err := s.readPreface(buf); err != nil {
 			return connection.ErrStreamUnrecoverable(err)
 		}
@@ -207,11 +209,15 @@ func (s *HTTPStream) Process(event *connection.DataEvent) error {
 		// session
 		session := s.initSession(frame.Header().StreamID)
 
-		// update the bytes
-		if event.Direction == connection.Ingress {
-			session.rdBytes += int64(totalFrameSize)
-		} else {
+		// Attribute bytes to request/response (wrBytes/rdBytes) based on the
+		// logical client→server vs server→client flow, not raw socket
+		// read/write. For a client-role connection these coincide (writes are
+		// the request); for a server-role connection they're inverted (the
+		// request arrives via a read/Ingress event). See requestDirection.
+		if event.Direction == s.requestDirection() {
 			session.wrBytes += int64(totalFrameSize)
+		} else {
+			session.rdBytes += int64(totalFrameSize)
 		}
 
 		err = s.handleFrame(session, frame, framer, decoder)
@@ -226,6 +232,25 @@ func (s *HTTPStream) Process(event *connection.DataEvent) error {
 	}
 
 	return nil
+}
+
+// requestDirection returns the connection.Direction that carries client→server
+// bytes (the HTTP/2 client preface and request HEADERS/DATA frames) for this
+// connection, based on this endpoint's role (see connection.Source).
+//
+//   - Client role (this process dialed out, typical for `direction: egress`):
+//     the client preface and request frames are written by this process, so
+//     they arrive as connection.Egress events. The response is read, so it
+//     arrives as connection.Ingress.
+//   - Server role (this process accepted the connection, typical for
+//     `direction: ingress`): the client preface and request frames are
+//     received by this process, so they arrive as connection.Ingress events.
+//     The response is written, so it arrives as connection.Egress.
+func (s *HTTPStream) requestDirection() connection.Direction {
+	if s.conn != nil && s.conn.OpenEvent != nil && s.conn.OpenEvent.Source == connection.Server {
+		return connection.Ingress
+	}
+	return connection.Egress
 }
 
 func (s *HTTPStream) readPreface(buf *[]byte) error {

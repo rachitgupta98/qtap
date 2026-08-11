@@ -3,7 +3,10 @@ package http
 import (
 	"context"
 	"io"
+<<<<<<< Updated upstream
 	"strings"
+=======
+>>>>>>> Stashed changes
 	"testing"
 	"time"
 
@@ -150,7 +153,11 @@ func (m *mockBodyBuffer) Copy() []byte {
 }
 
 func (m *mockBodyBuffer) NewReader() io.Reader {
+<<<<<<< Updated upstream
 	return strings.NewReader("")
+=======
+	return nil
+>>>>>>> Stashed changes
 }
 
 func TestHTTP1Metrics(t *testing.T) {
